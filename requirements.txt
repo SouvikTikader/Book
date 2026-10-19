@@ -1,0 +1,5 @@
+streamlit
+langgraph
+ollama
+scikit-learn
+pandas

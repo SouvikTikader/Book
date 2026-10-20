@@ -1,4 +1,8 @@
-"""SQLite layer + the hospital 'environment' tools (Unit 3: tools & environment interaction)."""
+"""SQLite layer + the hospital 'environment' tools (Unit 3: tools & environment interaction).
+
+WAL mode + busy_timeout=30 s so init_db() and the waitlist watcher can coexist
+without 'database is locked' on Windows.
+"""
 import os
 import sqlite3
 from datetime import date, timedelta
@@ -23,13 +27,22 @@ DOCTORS = [
     (7, "Dr. Joshi", "orthopedics"), (8, "Dr. Desai", "general"),
     (9, "Dr. Kulkarni", "pediatrics"),
 ]
-# tomorrow's busy windows (doctor_id -> [start, end)) so the demo has a clear earliest slot + retry path
 BLOCK = {1: ("15:00", "16:30"), 2: ("15:00", "15:30"), 3: ("15:00", "23:59"), 4: ("15:00", "16:00")}
 
 
 def conn():
-    c = sqlite3.connect(DB)
+    """Open a connection with WAL + 30 s busy timeout. Safe for concurrent readers/writers."""
+    c = sqlite3.connect(DB, timeout=30.0, isolation_level=None)
     c.row_factory = sqlite3.Row
+    # These are persistent settings on the DB file — cheap to re-apply on each connection.
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=30000")
+        c.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        # If another process is currently holding the lock at startup, just proceed —
+        # busy_timeout will kick in on the next statement.
+        pass
     return c
 
 
@@ -38,7 +51,7 @@ def day_offset(n):
 
 
 def _times():
-    return [f"{h:02d}:{m:02d}" for h in range(9, 18) for m in (0, 30)]  # 09:00 .. 17:30
+    return [f"{h:02d}:{m:02d}" for h in range(9, 18) for m in (0, 30)]
 
 
 def _seed_slots(c):
@@ -53,73 +66,87 @@ def _seed_slots(c):
 
 
 def init_db():
+    """Idempotent. Safe to call from multiple processes (uses WAL + busy_timeout)."""
     c = conn()
-    c.executescript(SCHEMA)
-    c.executemany("INSERT OR IGNORE INTO doctors VALUES (?,?,?)", DOCTORS)
-    if not c.execute("SELECT COUNT(*) FROM patients").fetchone()[0]:
-        c.execute("INSERT INTO patients(name,phone) VALUES ('Anita','9876543210')")  # id 1: returning patient
-        c.execute("INSERT INTO patients(name,phone) VALUES ('Ravi','9123456780')")   # id 2: no history
-        c.execute("INSERT INTO memory VALUES (1,'preferred_doctor','Dr. Mehta')")
-        c.executemany("INSERT INTO feedback(patient_id,doctor_id,event) VALUES (?,?,?)",
-                      [(1, 1, "accepted"), (1, 1, "accepted"), (1, 2, "rejected")])
-    if not c.execute("SELECT COUNT(*) FROM slots WHERE day=?", (day_offset(0),)).fetchone()[0]:
-        _seed_slots(c)
-    c.commit()
-    c.close()
+    try:
+        c.executescript(SCHEMA)
+        c.executemany("INSERT OR IGNORE INTO doctors VALUES (?,?,?)", DOCTORS)
+        if not c.execute("SELECT COUNT(*) FROM patients").fetchone()[0]:
+            c.execute("INSERT INTO patients(name,phone) VALUES ('Anita','9876543210')")
+            c.execute("INSERT INTO patients(name,phone) VALUES ('Ravi','9123456780')")
+            c.execute("INSERT INTO memory VALUES (1,'preferred_doctor','Dr. Mehta')")
+            c.executemany("INSERT INTO feedback(patient_id,doctor_id,event) VALUES (?,?,?)",
+                          [(1, 1, "accepted"), (1, 1, "accepted"), (1, 2, "rejected")])
+        if not c.execute("SELECT COUNT(*) FROM slots WHERE day=?", (day_offset(0),)).fetchone()[0]:
+            _seed_slots(c)
+    finally:
+        c.close()
 
 
 def reset():
-    if os.path.exists(DB):
-        os.remove(DB)
+    """Delete the DB *and its WAL/SHM sidecars*, then re-seed."""
+    for suffix in ("", "-wal", "-shm"):
+        p = DB + suffix
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
     init_db()
 
 
 # ------------------------------------------------------------------ TOOLS
 def search_doctors(specialty):
     c = conn()
-    rows = [dict(r) for r in c.execute("SELECT * FROM doctors WHERE specialty=?", (specialty,))]
-    c.close()
-    return rows
+    try:
+        return [dict(r) for r in c.execute("SELECT * FROM doctors WHERE specialty=?", (specialty,))]
+    finally:
+        c.close()
 
 
 def get_slots(doctor_id, day, after="00:00"):
     c = conn()
-    rows = [dict(r) for r in c.execute(
-        "SELECT * FROM slots WHERE doctor_id=? AND day=? AND time>=? AND booked=0 ORDER BY time",
-        (doctor_id, day, after))]
-    c.close()
-    return rows
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM slots WHERE doctor_id=? AND day=? AND time>=? AND booked=0 ORDER BY time",
+            (doctor_id, day, after))]
+    finally:
+        c.close()
 
 
 def book_slot(slot_id, patient_id):
-    """Atomic: the UPDATE only succeeds if the slot is still free (prevents double booking)."""
+    """Atomic: the UPDATE only succeeds if the slot is still free."""
     c = conn()
-    cur = c.execute("UPDATE slots SET booked=1 WHERE id=? AND booked=0", (slot_id,))
-    if cur.rowcount == 0:
+    try:
+        cur = c.execute("UPDATE slots SET booked=1 WHERE id=? AND booked=0", (slot_id,))
+        if cur.rowcount == 0:
+            return {"ok": False, "reason": "slot_taken"}
+        s = c.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
+        cur = c.execute(
+            "INSERT INTO appointments(patient_id,doctor_id,day,time,status) VALUES (?,?,?,?,'confirmed')",
+            (patient_id, s["doctor_id"], s["day"], s["time"]),
+        )
+        return {"ok": True, "appointment_id": cur.lastrowid,
+                "doctor_id": s["doctor_id"], "day": s["day"], "time": s["time"]}
+    finally:
         c.close()
-        return {"ok": False, "reason": "slot_taken"}
-    s = c.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
-    cur = c.execute("INSERT INTO appointments(patient_id,doctor_id,day,time,status) VALUES (?,?,?,?,'confirmed')",
-                    (patient_id, s["doctor_id"], s["day"], s["time"]))
-    c.commit()
-    out = {"ok": True, "appointment_id": cur.lastrowid, "doctor_id": s["doctor_id"], "day": s["day"], "time": s["time"]}
-    c.close()
-    return out
 
 
 def simulate_conflict(slot_id):
-    """Demo helper: another patient grabs the slot between proposal and booking."""
     c = conn()
-    c.execute("UPDATE slots SET booked=1 WHERE id=?", (slot_id,))
-    c.commit()
-    c.close()
+    try:
+        c.execute("UPDATE slots SET booked=1 WHERE id=?", (slot_id,))
+    finally:
+        c.close()
 
 
 def add_waitlist(patient_id, specialty, day):
     c = conn()
-    c.execute("INSERT INTO waitlist(patient_id,specialty,day) VALUES (?,?,?)", (patient_id, specialty, day))
-    c.commit()
-    c.close()
+    try:
+        c.execute("INSERT INTO waitlist(patient_id,specialty,day) VALUES (?,?,?)",
+                  (patient_id, specialty, day))
+    finally:
+        c.close()
 
 
 def mask_phone(p):
@@ -128,55 +155,72 @@ def mask_phone(p):
 
 def send_notification(patient_id, message):
     c = conn()
-    c.execute("INSERT INTO notifications(patient_id,message) VALUES (?,?)", (patient_id, message))
-    c.commit()
-    c.close()
+    try:
+        c.execute("INSERT INTO notifications(patient_id,message) VALUES (?,?)",
+                  (patient_id, message))
+    finally:
+        c.close()
     p = get_patient(patient_id)
-    return f"SMS sent to {mask_phone(p.get('phone'))}"  # guardrail: phone masked in logs
+    return f"SMS sent to {mask_phone(p.get('phone'))}"
 
 
-# ------------------------------------------------------------------ helpers
 def get_patient(pid):
     c = conn()
-    r = c.execute("SELECT * FROM patients WHERE id=?", (pid,)).fetchone()
-    c.close()
-    return dict(r) if r else {}
+    try:
+        r = c.execute("SELECT * FROM patients WHERE id=?", (pid,)).fetchone()
+        return dict(r) if r else {}
+    finally:
+        c.close()
 
 
 def list_patients():
     c = conn()
-    rows = [dict(r) for r in c.execute("SELECT * FROM patients")]
-    c.close()
-    return rows
+    try:
+        return [dict(r) for r in c.execute("SELECT * FROM patients")]
+    finally:
+        c.close()
 
 
 def create_patient(name):
     c = conn()
-    cur = c.execute("INSERT INTO patients(name,phone) VALUES (?,NULL)", (name,))
-    c.commit()
-    pid = cur.lastrowid
-    c.close()
-    return pid
+    try:
+        cur = c.execute("INSERT INTO patients(name,phone) VALUES (?,NULL)", (name,))
+        return cur.lastrowid
+    finally:
+        c.close()
 
 
 def set_phone(pid, phone):
     c = conn()
-    c.execute("UPDATE patients SET phone=? WHERE id=?", (phone, pid))
-    c.commit()
-    c.close()
+    try:
+        c.execute("UPDATE patients SET phone=? WHERE id=?", (phone, pid))
+    finally:
+        c.close()
 
 
 def get_doctor(did):
     c = conn()
-    r = c.execute("SELECT * FROM doctors WHERE id=?", (did,)).fetchone()
-    c.close()
-    return dict(r) if r else {}
+    try:
+        r = c.execute("SELECT * FROM doctors WHERE id=?", (did,)).fetchone()
+        return dict(r) if r else {}
+    finally:
+        c.close()
 
 
 def appointments_for(pid):
     c = conn()
-    rows = [dict(r) for r in c.execute(
-        "SELECT a.id, d.name AS doctor, a.day, a.time, a.status FROM appointments a "
-        "JOIN doctors d ON d.id=a.doctor_id WHERE a.patient_id=? ORDER BY a.id DESC", (pid,))]
-    c.close()
-    return rows
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT a.id, d.name AS doctor, a.day, a.time, a.status FROM appointments a "
+            "JOIN doctors d ON d.id=a.doctor_id WHERE a.patient_id=? ORDER BY a.id DESC", (pid,))]
+    finally:
+        c.close()
+
+
+def notifications_for(pid):
+    c = conn()
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT id, message FROM notifications WHERE patient_id=? ORDER BY id DESC LIMIT 20", (pid,))]
+    finally:
+        c.close()
